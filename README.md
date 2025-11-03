@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AgriAgent MVP
 
 This repository contains a working MVP for an AI Agent to support smallholder farmers via WhatsApp.
@@ -17,3 +18,7 @@ To run locally:
    - `uvicorn app.main:app --reload --port 8000`
 3. Expose webhook with ngrok and configure Twilio sandbox webhook to `https://<ngrok-id>.ngrok.io/webhook`
 
+=======
+# agricagent-api
+AgricAgent FastAPI backend
+>>>>>>> 42989f5774e08513efe6fd9e6113629cf1ab61cf
