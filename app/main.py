@@ -22,7 +22,6 @@ app = FastAPI(
     description="AI-powered agriculture assistant API for Flutter and WhatsApp integration.",
     version="1.0.0"
 
-from fastapi.responses import JSONResponse
 
 @app.get("/routes", response_class=JSONResponse)
 async def routes_list():
