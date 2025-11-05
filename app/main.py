@@ -21,6 +21,14 @@ app = FastAPI(
     title="AgricAgent API",
     description="AI-powered agriculture assistant API for Flutter and WhatsApp integration.",
     version="1.0.0"
+
+from fastapi.responses import JSONResponse
+
+@app.get("/routes", response_class=JSONResponse)
+async def routes_list():
+    """Return a list of available routes for diagnostics."""
+    return {"routes": [route.path for route in app.routes]}
+
 )
 
 # --- Load Twilio credentials (optional for image download) ---
