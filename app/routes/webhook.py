@@ -18,15 +18,20 @@ router = APIRouter()
 # Helper: Generate AI reply or fallback
 # ==========================================================
 def ai_reply_text(prompt_text: str) -> str:
+    """
+    Generates an AI reply using OpenAI's Responses API.
+    Falls back gracefully if the key or model is unavailable.
+    """
     if not client:
         return "👋 I received your message. (AI disabled — please set OPENAI_API_KEY.)"
+
     try:
-        completion = client.responses.create(
+        completion = client.responses.create(   # ✅ correct method name
             model="gpt-4.1-mini",
             input=[
                 {"role": "system", "content": (
                     "You are AgriAgent, a concise and practical assistant for smallholder farmers. "
-                    "Provide safe, actionable, context-specific guidance in 2–4 sentences."
+                    "Provide safe, actionable, and context-specific advice in 2–4 short sentences."
                 )},
                 {"role": "user", "content": prompt_text},
             ],
@@ -72,4 +77,67 @@ async def chat(payload: dict):
 
 # ==========================================================
 # 4️⃣ Image upload endpoint — app sends image for identification
-#    - Accepts either "file" or "image" fiel
+#    - Accepts either "file" or "image" field name
+# ==========================================================
+@router.post("/identify")
+async def identify(
+    file: UploadFile = File(None),
+    image: UploadFile = File(None)
+):
+    upload = file or image
+    if not upload:
+        raise HTTPException(status_code=400, detail="Please upload an image file.")
+
+    if not upload.content_type or not upload.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
+
+    reply = ai_reply_text(
+        f"A farmer uploaded an image named '{upload.filename}'. "
+        "Describe general guidance on analyzing crop or soil images safely."
+    )
+    return {"filename": upload.filename, "reply": reply}
+
+# ==========================================================
+# 5️⃣ WhatsApp Webhook for Twilio
+# ==========================================================
+def twiml_reply(text: str) -> Response:
+    safe = html.escape(text, quote=True)
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>'
+    return Response(content=xml, media_type="application/xml")
+
+@router.post("/webhook")
+async def whatsapp_webhook(
+    From: str = Form(default=""),
+    Body: str = Form(default=""),
+    NumMedia: str = Form(default="0"),
+    MediaUrl0: str | None = Form(default=None),
+    MediaContentType0: str | None = Form(default=None),
+):
+    """
+    Handles WhatsApp messages from Twilio.
+    Replies with TwiML so Twilio sends back the response automatically.
+    """
+    print(f"📩 Message from {From}: {Body}")
+    if (NumMedia and NumMedia != "0") or MediaUrl0:
+        prompt = (
+            f"Farmer says: {Body or '(no text)'}\n"
+            f"They also sent an image: {MediaUrl0 or '(unavailable)'}"
+        )
+    else:
+        prompt = f"Farmer says: {Body or '(no text)'}"
+
+    reply = ai_reply_text(prompt)
+    return twiml_reply(reply)
+
+# ==========================================================
+# 6️⃣ Support trailing slash (Twilio compatibility)
+# ==========================================================
+@router.post("/webhook/")
+async def whatsapp_webhook_trailing(
+    From: str = Form(default=""),
+    Body: str = Form(default=""),
+    NumMedia: str = Form(default="0"),
+    MediaUrl0: str | None = Form(default=None),
+    MediaContentType0: str | None = Form(default=None),
+):
+    return await whatsapp_webhook(From, Body, NumMedia, MediaUrl0, MediaContentType0)
