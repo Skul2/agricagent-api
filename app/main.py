@@ -1,158 +1,157 @@
-# app/main.py
 import os
 import base64
-import tempfile
+import httpx
+from fastapi import FastAPI, Depends, Form, UploadFile, File
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.requests import Request
+from dotenv import load_dotenv
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="AgricAgent API")
+from .database import engine, Base, get_db
+from .models import Message
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-# CORS so Flutter can connect
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from .utils.file_io import decode_data_url, save_bytes_to_file
+from .agent import analyze_image_with_openai, infer_category_from_text
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+load_dotenv()
 
-_openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print("⚠️ OpenAI client unavailable:", e)
+app = FastAPI(title="AgriAgent API", version="0.2.0")
 
+# ============================================
+# STARTUP EVENT: Create tables automatically
+# ============================================
+@app.on_event("startup")
+async def on_startup():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "AgricAgent API is running 🚜"}
+# ============================================
+# HEALTH CHECK
+# ============================================
+@app.get("/", response_class=PlainTextResponse)
+async def health():
+    return "AgriAgent API up and running ✅"
 
-
-@app.get("/routes")
-async def routes():
-    return {"routes": ["/", "/chat", "/identify", "/routes"]}
-
-
-# ---------- CHAT ----------
-class ChatRequest(BaseModel):
-    message: str
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    user_msg = (req.message or "").strip()
-    if not user_msg:
-        raise HTTPException(status_code=400, detail="Empty message")
-
-    # Direct OpenAI call for smart advice
-    if _openai_client:
-        try:
-            res = _openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are AgricAgent, an AI expert on crops, soil, animals, and farming. "
-                            "Always respond in full paragraphs using HTML <b> tags for headings. "
-                            "Include clear, practical, and friendly explanations."
-                        ),
-                    },
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.5,
-            )
-            return {"reply": res.choices[0].message.content.strip()}
-        except Exception as e:
-            print("⚠️ Chat AI error:", e)
-
-    # fallback
-    return {"reply": f"<b>Note:</b> Could not contact AI. You asked: {user_msg}"}
-
-
-# ---------- IDENTIFY ----------
-def save_upload_to_temp(file: UploadFile) -> str:
-    suffix = os.path.splitext(file.filename or "image.jpg")[1]
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(file.file.read())
-    tmp.close()
-    return tmp.name
-
-
-def encode_b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode()
-
-
-@app.post("/identify")
-async def identify(
-    file: Optional[UploadFile] = File(None),
-    image_b64: Optional[str] = Form(None),
+# ============================================
+# WEBHOOK: Handles Twilio and App uploads
+# ============================================
+@app.post("/webhook")
+async def whatsapp_webhook(
+    request: Request,
+    From: str = Form(default=None),
+    Body: str = Form(default=""),
+    MediaUrl0: str = Form(default=None),
+    MediaContentType0: str = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Identify any plant, animal, or farm-related image.
-    Works with Flutter image picker (camera/gallery).
+    This route handles both:
+      1. Twilio form POSTs (MediaUrl0, MediaContentType0)
+      2. Direct uploads from Flutter (multipart file)
     """
-    try:
-        if file is None and not image_b64:
-            raise HTTPException(status_code=400, detail="No image provided")
 
-        # save image
-        if file:
-            img_path = save_upload_to_temp(file)
+    saved_path = None
+    media_type = MediaContentType0
+    image_url_for_model = None
+
+    # ----------------------------
+    # CASE 1: Direct upload (Flutter app)
+    # ----------------------------
+    if file is not None:
+        content = await file.read()
+        ext = os.path.splitext(file.filename)[-1].replace(".", "") or "jpg"
+        saved_path = save_bytes_to_file(content, ext_hint=ext)
+        mime = media_type or f"image/{ext}"
+        data_url = f"data:{mime};base64,{base64.b64encode(content).decode()}"
+        image_url_for_model = data_url
+        media_type = mime
+
+    # ----------------------------
+    # CASE 2: Twilio sends MediaUrl0 (URL or base64 data)
+    # ----------------------------
+    elif MediaUrl0:
+        decoded = decode_data_url(MediaUrl0)
+        if decoded:
+            raw, mime, ext = decoded
+            saved_path = save_bytes_to_file(raw, ext_hint=ext)
+            image_url_for_model = MediaUrl0
+            media_type = mime
         else:
-            img_bytes = base64.b64decode(image_b64.split(",")[-1])
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-            tmp.write(img_bytes)
-            tmp.close()
-            img_path = tmp.name
-
-        # --- AI Vision ---
-        if _openai_client:
             try:
-                b64 = encode_b64(img_path)
-                result = _openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are AgricAgent Vision, an agricultural vision AI. "
-                                "Analyze the given image. Identify what it shows — "
-                                "plant, animal, insect, disease, or other. "
-                                "Then describe it clearly and give practical advice "
-                                "for care, treatment, or improvement. "
-                                "Format the response using <b> for headings."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "Identify and describe this image:"},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                            ],
-                        },
-                    ],
-                    temperature=0.5,
-                )
-                text = result.choices[0].message.content.strip()
-                return {"ok": True, "details": text}
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r = await client.get(MediaUrl0)
+                    r.raise_for_status()
+                    ct = r.headers.get("content-type", "image/jpeg")
+                    ext = "jpg" if "png" not in ct else "png"
+                    saved_path = save_bytes_to_file(r.content, ext_hint=ext)
+                    media_type = ct
+                image_url_for_model = MediaUrl0
             except Exception as e:
-                print("⚠️ Vision model failed:", e)
+                print(f"⚠️ Failed to fetch media: {e}")
+                image_url_for_model = None
 
-        # --- fallback if no AI ---
-        name = file.filename.lower() if file else "unknown"
-        if "leaf" in name or "plant" in name:
-            return {"ok": True, "details": "<b>Plant Leaf</b><br>Possible stress or deficiency detected."}
-        if "cow" in name:
-            return {"ok": True, "details": "<b>Cow</b><br>Healthy appearance, ensure adequate feed & water."}
-        return {"ok": True, "details": "<b>Unknown Image</b><br>Could not identify clearly."}
+    # ----------------------------
+    # Analyze image (if any)
+    # ----------------------------
+    if image_url_for_model:
+        analysis = analyze_image_with_openai(Body, image_url_for_model)
+    else:
+        analysis = (
+            "No image received. Please send a clear photo of your crop, soil, or insect for analysis."
+        )
 
-    except Exception as e:
-        print("❌ Error in /identify:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+    # ----------------------------
+    # Infer category & save to DB
+    # ----------------------------
+    category = infer_category_from_text(Body)
+
+    msg = Message(
+        from_number=From,
+        body=Body,
+        media_type=media_type,
+        media_local_path=saved_path,
+        category=category,
+        analysis=analysis,
+    )
+
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+
+    # ----------------------------
+    # Response for both App & Twilio
+    # ----------------------------
+    return JSONResponse(
+        {
+            "status": "ok",
+            "message_id": msg.id,
+            "from": From,
+            "category": category,
+            "analysis": analysis[:1000],
+            "saved_path": saved_path,
+        }
+    )
+
+# ============================================
+# GET /messages: For Admin & Debug
+# ============================================
+@app.get("/messages")
+async def list_messages(db: AsyncSession = Depends(get_db), limit: int = 50):
+    q = await db.execute(select(Message).order_by(Message.id.desc()).limit(limit))
+    rows = q.scalars().all()
+    return [
+        {
+            "id": m.id,
+            "from_number": m.from_number,
+            "body": m.body,
+            "media_type": m.media_type,
+            "media_local_path": m.media_local_path,
+            "category": m.category,
+            "analysis": m.analysis,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in rows
+    ]
