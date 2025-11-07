@@ -20,15 +20,13 @@ def ai_reply_text(prompt_text: str) -> str:
             messages=[
                 {"role": "system", "content": (
                     "You are AgriAgent, an agronomist AI. "
-                    "Analyse farmer messages or images. "
-                    "Be clear, specific, safe, and practical. "
-                    "Always identify likely plant/crop if possible, "
-                    "describe visible issues or symptoms, "
-                    "and suggest 1–3 concrete next steps or treatments."
+                    "You must identify the likely crop/plant in the user's message or image context, "
+                    "describe any visible or likely problem (pest, disease, nutrient, water, etc.), "
+                    "and provide 2–3 clear, safe, region-neutral recommendations or treatments."
                 )},
                 {"role": "user", "content": prompt_text},
             ],
-            max_tokens=300,
+            max_tokens=400,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
@@ -37,7 +35,7 @@ def ai_reply_text(prompt_text: str) -> str:
 # ---------- Health ----------
 @router.get("/check")
 def check():
-    return {"ok": True, "status": "ok", "service": "AgriAgent API", "webhook": "/webhook", "version": "1.1.0"}
+    return {"ok": True, "status": "ok", "service": "AgriAgent API", "version": "1.2.0"}
 
 # ---------- Text ----------
 class ChatIn(BaseModel):
@@ -58,32 +56,32 @@ async def message(payload: ChatIn):
 
 # ---------- Image ----------
 @router.post("/identify")
-async def identify(
-    file: UploadFile = File(None),
-    image: UploadFile = File(None)
-):
+async def identify(file: UploadFile = File(None), image: UploadFile = File(None)):
     upload = file or image
     if not upload:
-        raise HTTPException(status_code=400, detail="No image found. Use field name 'file' or 'image'.")
-
+        raise HTTPException(status_code=400, detail="No image found; use 'file' or 'image'.")
     ctype = (upload.content_type or "").lower().strip()
     if not ctype.startswith("image/"):
         guessed, _ = mimetypes.guess_type(upload.filename or "")
         if not guessed or not guessed.startswith("image/"):
             raise HTTPException(status_code=400, detail="Invalid image type.")
 
-    # read bytes (optional for future vision model use)
-    data = await upload.read()
+    # read bytes (future vision use)
+    await upload.read()
 
-    # instruct AI specifically for image context
     prompt = (
         f"A farmer uploaded an image named '{upload.filename}'. "
-        "Without seeing the image directly, infer the possible crop or plant name from context "
-        "and describe 1) what problem it might have (e.g., pest, disease, nutrient issue, dryness), "
-        "and 2) provide clear, safe next steps or treatments the farmer should follow. "
-        "Be short, practical, and region-agnostic."
+        "Without seeing it directly, infer what crop or plant this likely shows, "
+        "guess the possible issue (disease, pest, nutrient, water), "
+        "and write:\n\n"
+        "1️⃣ **Crop or Plant Name**\n"
+        "2️⃣ **Problem Description**\n"
+        "3️⃣ **Recommended Solution / Treatment**\n"
+        "Be concise but specific and practical for smallholder farmers."
     )
+
     reply = ai_reply_text(prompt)
+    print(f"🖼️ Received image: {upload.filename} ({ctype}) -> Reply: {reply[:80]}...")
     return {"filename": upload.filename, "reply": reply}
 
 # ---------- Twilio ----------
