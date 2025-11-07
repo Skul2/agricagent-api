@@ -7,36 +7,40 @@ from starlette.requests import Request
 from dotenv import load_dotenv
 from typing import Optional
 
-from .database import engine, Base, get_db
-from .models import Message
+# ✅ Absolute imports (Render-safe)
+from app.database import engine, Base, get_db
+from app.models import Message
+from app.utils.file_io import decode_data_url, save_bytes_to_file
+from app.agent import analyze_image_with_openai, infer_category_from_text
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from .utils.file_io import decode_data_url, save_bytes_to_file
-from .agent import analyze_image_with_openai, infer_category_from_text
-
+# ===================================================
+# ENVIRONMENT
+# ===================================================
 load_dotenv()
 
-app = FastAPI(title="AgriAgent API", version="0.2.0")
+app = FastAPI(title="AgriAgent API", version="0.2.1")
 
-# ============================================
-# STARTUP EVENT: Create tables automatically
-# ============================================
+# ===================================================
+# STARTUP EVENT — auto-create tables
+# ===================================================
 @app.on_event("startup")
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# ============================================
+# ===================================================
 # HEALTH CHECK
-# ============================================
+# ===================================================
 @app.get("/", response_class=PlainTextResponse)
 async def health():
     return "AgriAgent API up and running ✅"
 
-# ============================================
-# WEBHOOK: Handles Twilio and App uploads
-# ============================================
+# ===================================================
+# WEBHOOK — supports Twilio & Flutter uploads
+# ===================================================
 @app.post("/webhook")
 async def whatsapp_webhook(
     request: Request,
@@ -48,8 +52,8 @@ async def whatsapp_webhook(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    This route handles both:
-      1. Twilio form POSTs (MediaUrl0, MediaContentType0)
+    Handles both:
+      1. Twilio-style WhatsApp messages (MediaUrl0 / MediaContentType0)
       2. Direct uploads from Flutter (multipart file)
     """
 
@@ -57,9 +61,9 @@ async def whatsapp_webhook(
     media_type = MediaContentType0
     image_url_for_model = None
 
-    # ----------------------------
-    # CASE 1: Direct upload (Flutter app)
-    # ----------------------------
+    # ---------------------------------------------------
+    # CASE 1: Flutter app — user directly uploads a file
+    # ---------------------------------------------------
     if file is not None:
         content = await file.read()
         ext = os.path.splitext(file.filename)[-1].replace(".", "") or "jpg"
@@ -69,9 +73,9 @@ async def whatsapp_webhook(
         image_url_for_model = data_url
         media_type = mime
 
-    # ----------------------------
-    # CASE 2: Twilio sends MediaUrl0 (URL or base64 data)
-    # ----------------------------
+    # ---------------------------------------------------
+    # CASE 2: Twilio webhook — remote MediaUrl
+    # ---------------------------------------------------
     elif MediaUrl0:
         decoded = decode_data_url(MediaUrl0)
         if decoded:
@@ -85,7 +89,7 @@ async def whatsapp_webhook(
                     r = await client.get(MediaUrl0)
                     r.raise_for_status()
                     ct = r.headers.get("content-type", "image/jpeg")
-                    ext = "jpg" if "png" not in ct else "png"
+                    ext = "png" if "png" in ct else "jpg"
                     saved_path = save_bytes_to_file(r.content, ext_hint=ext)
                     media_type = ct
                 image_url_for_model = MediaUrl0
@@ -93,19 +97,19 @@ async def whatsapp_webhook(
                 print(f"⚠️ Failed to fetch media: {e}")
                 image_url_for_model = None
 
-    # ----------------------------
-    # Analyze image (if any)
-    # ----------------------------
+    # ---------------------------------------------------
+    # ANALYSIS — call OpenAI Vision
+    # ---------------------------------------------------
     if image_url_for_model:
         analysis = analyze_image_with_openai(Body, image_url_for_model)
     else:
         analysis = (
-            "No image received. Please send a clear photo of your crop, soil, or insect for analysis."
+            "No image received. Please send or capture a clear photo of your crop, soil, or insect."
         )
 
-    # ----------------------------
-    # Infer category & save to DB
-    # ----------------------------
+    # ---------------------------------------------------
+    # CATEGORY DETECTION & SAVE TO DATABASE
+    # ---------------------------------------------------
     category = infer_category_from_text(Body)
 
     msg = Message(
@@ -121,9 +125,9 @@ async def whatsapp_webhook(
     await db.commit()
     await db.refresh(msg)
 
-    # ----------------------------
-    # Response for both App & Twilio
-    # ----------------------------
+    # ---------------------------------------------------
+    # RESPONSE — works for Twilio & Flutter
+    # ---------------------------------------------------
     return JSONResponse(
         {
             "status": "ok",
@@ -135,9 +139,9 @@ async def whatsapp_webhook(
         }
     )
 
-# ============================================
-# GET /messages: For Admin & Debug
-# ============================================
+# ===================================================
+# GET /messages — for Admin & Debug
+# ===================================================
 @app.get("/messages")
 async def list_messages(db: AsyncSession = Depends(get_db), limit: int = 50):
     q = await db.execute(select(Message).order_by(Message.id.desc()).limit(limit))
