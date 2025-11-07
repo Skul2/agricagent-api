@@ -62,27 +62,14 @@ async def message(payload: ChatIn):
 
 # ==========================================================
 # 3️⃣ Alias for Flutter apps still calling /chat (old endpoint)
+#    - Accepts both {"text": "..."} and {"message": "..."}
 # ==========================================================
 @router.post("/chat")
-async def chat(payload: ChatIn):
-    """
-    Alias for /message — older Flutter app builds use /chat
-    """
-    reply = ai_reply_text(f"Farmer says: {payload.text}")
+async def chat(payload: dict):
+    text = payload.get("text") or payload.get("message") or ""
+    reply = ai_reply_text(f"Farmer says: {text}")
     return {"reply": reply}
 
 # ==========================================================
 # 4️⃣ Image upload endpoint — app sends image for identification
-# ==========================================================
-@router.post("/identify")
-async def identify(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image file.")
-
-    reply = ai_reply_text(
-        f"A farmer uploaded an image named '{file.filename}'. "
-        "Describe general guidance on analyzing crop or soil images safely."
-    )
-    return {"filename": file.filename, "reply": reply}
-
-# =============================================
+#    - Accepts either "file" or "image" fiel
