@@ -1,8 +1,7 @@
 from fastapi import APIRouter, Form, Response, UploadFile, File, HTTPException
 from pydantic import BaseModel
-import os, html, mimetypes, base64
+import os, html, mimetypes
 
-# ---------- OpenAI client ----------
 try:
     from openai import OpenAI
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -13,9 +12,7 @@ router = APIRouter()
 
 # ---------- AI helper ----------
 def ai_reply_text(prompt_text: str) -> str:
-    """
-    Handles pure text-based replies.
-    """
+    """Send text to OpenAI for a structured agronomic reply."""
     if not client:
         return "👋 I received your message. (AI disabled — please set OPENAI_API_KEY.)"
     try:
@@ -25,9 +22,8 @@ def ai_reply_text(prompt_text: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "You are AgriAgent, an intelligent agricultural assistant. "
-                        "When given farmer text, respond clearly and practically, focusing "
-                        "on crops, livestock, soil, weather, or pest management."
+                        "You are AgriAgent, an expert agronomist AI for farmers. "
+                        "When given a text or image upload notice, provide a clear, structured, and practical answer."
                     ),
                 },
                 {"role": "user", "content": prompt_text},
@@ -38,18 +34,15 @@ def ai_reply_text(prompt_text: str) -> str:
     except Exception as e:
         return f"AI error: {e}"
 
-
-# ---------- Health check ----------
+# ---------- Health ----------
 @router.get("/check")
 def check():
-    return {"ok": True, "status": "ok", "service": "AgriAgent API", "version": "2.0.0"}
+    return {"ok": True, "status": "ok", "service": "AgriAgent API", "version": "2.1.0"}
 
-
-# ---------- Text chat ----------
+# ---------- Text ----------
 class ChatIn(BaseModel):
     text: str | None = None
     message: str | None = None
-
 
 @router.post("/chat")
 async def chat(payload: dict):
@@ -57,29 +50,23 @@ async def chat(payload: dict):
     reply = ai_reply_text(f"Farmer says: {text}")
     return {"reply": reply}
 
-
 @router.post("/message")
 async def message(payload: ChatIn):
     text = payload.text or payload.message or ""
     reply = ai_reply_text(f"Farmer says: {text}")
     return {"reply": reply}
 
-
-# ---------- Image Identification ----------
+# ---------- Image ----------
 @router.post("/identify")
 async def identify(
     file: UploadFile = File(None),
     image: UploadFile = File(None),
-    context: str | None = Form(default=None)
+    context: str | None = Form(default=None),
 ):
-    """
-    Identifies plants, animals, insects, or crop issues from an uploaded image.
-    Accepts image in 'file' (preferred) or 'image'.
-    Optional 'context' (text hint) may include region, crop, or symptoms.
-    """
+    """Accepts an uploaded image and context, infers the likely crop/issue."""
     upload = file or image
     if not upload:
-        raise HTTPException(status_code=400, detail="No image found. Use field 'file' or 'image'.")
+        raise HTTPException(status_code=400, detail="No image found. Use 'file' or 'image'.")
 
     ctype = (upload.content_type or "").lower().strip()
     if not ctype.startswith("image/"):
@@ -87,57 +74,33 @@ async def identify(
         if not guessed or not guessed.startswith("image/"):
             raise HTTPException(status_code=400, detail=f"Invalid image type: {ctype or 'unknown'}")
 
-    # Read image bytes and encode in Base64 for API
-    img_bytes = await upload.read()
-    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-    data_uri = f"data:{ctype};base64,{img_b64}"
+    _ = await upload.read()  # read to consume stream
 
-    if not client:
-        return {"ok": False, "error": "AI disabled — please set OPENAI_API_KEY."}
-
-    # Define a strong, structured prompt
     prompt = (
-        "You are AgriAgent, an expert agricultural assistant. "
-        "Analyze the following image of a plant, insect, or animal and provide a clear, structured answer:\n\n"
-        "1️⃣ **Crop/Plant/Animal:** Name or type\n"
-        "2️⃣ **Likely Problem:** Disease, pest, or condition (if any)\n"
-        "3️⃣ **Why:** Short explanation based on visible signs\n"
-        "4️⃣ **Recommended Action:** Practical treatment or management advice\n"
-        "5️⃣ **Preventive Tips:** How to avoid recurrence\n\n"
-        "If healthy, say 'Healthy specimen detected.' Be specific but concise."
+        f"A farmer uploaded an image named '{upload.filename}'. "
+        f"Extra context: {context or '(none provided)'}.\n\n"
+        "You cannot view the image but must infer the most likely crop or animal, problem, cause, and advice.\n"
+        "Return your answer **only** in this format:\n\n"
+        "Crop/Plant or Animal: <name>\n"
+        "Likely Problem: <short diagnosis>\n"
+        "Why: <1–2 sentences>\n"
+        "Recommended Action: <practical steps>\n"
+        "Preventive Tips: <short bullet points>\n"
     )
 
     try:
-        # Send image and text context to OpenAI Vision model
-        response = client.responses.create(
-            model="gpt-4o-mini",
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {"type": "input_text", "text": f"Farmer's context: {context or 'none provided'}"},
-                        {"type": "input_image", "image_data": data_uri},
-                    ],
-                }
-            ],
-        )
-
-        reply_text = response.output[0].content[0].text.strip()
-        print(f"🖼️ /identify -> name={upload.filename} type={ctype} context={context!r} reply={reply_text[:120]}...")
-        return {"ok": True, "filename": upload.filename, "reply": reply_text}
-
+        reply = ai_reply_text(prompt)
+        print(f"🖼️ /identify -> name={upload.filename} type={ctype} context={context!r} reply={reply[:120]}...")
+        return {"filename": upload.filename, "reply": reply}
     except Exception as e:
         print(f"❌ Image identify error: {e}")
-        return {"ok": False, "error": f"AI error: {e}"}
+        return {"error": str(e), "ok": False}
 
-
-# ---------- Twilio Webhook ----------
+# ---------- Twilio ----------
 def twiml_reply(text: str) -> Response:
     safe = html.escape(text, quote=True)
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>'
     return Response(content=xml, media_type="application/xml")
-
 
 @router.post("/webhook")
 async def whatsapp_webhook(
@@ -149,15 +112,12 @@ async def whatsapp_webhook(
 ):
     print(f"📩 WhatsApp message from {From}: {Body}")
     if (NumMedia and NumMedia != "0") or MediaUrl0:
-        prompt = (
-            f"Farmer says: {Body or '(no text)'}\n"
-            f"They also sent an image: {MediaUrl0 or '(unavailable)'}"
-        )
+        prompt = f"Farmer says: {Body or '(no text)'}\nThey also sent an image: {MediaUrl0 or '(unavailable)'}"
     else:
         prompt = f"Farmer says: {Body or '(no text)'}"
+
     reply = ai_reply_text(prompt)
     return twiml_reply(reply)
-
 
 @router.post("/webhook/")
 async def whatsapp_webhook_trailing(
