@@ -11,3 +11,4 @@ openai==1.42.0
 apscheduler==3.10.1
 jinja2==3.1.2
 aiofiles==23.1.0
+Pillow==10.4.0
