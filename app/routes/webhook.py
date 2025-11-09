@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Form, Response, UploadFile, File, HTTPException
 from pydantic import BaseModel
-import os, html, mimetypes
+import os, html, mimetypes, base64
 
+# ---------- OpenAI client ----------
 try:
     from openai import OpenAI
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -12,17 +13,23 @@ router = APIRouter()
 
 # ---------- AI helper ----------
 def ai_reply_text(prompt_text: str) -> str:
+    """
+    Handles pure text-based replies.
+    """
     if not client:
         return "👋 I received your message. (AI disabled — please set OPENAI_API_KEY.)"
     try:
-        # Use a fast, capable model; swap to `gpt-4o` if you later enable vision.
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": (
-                    "You are AgriAgent, an agronomist AI for smallholder farmers. "
-                    "When given farmer text or an image upload notice, you MUST return a structured, practical answer."
-                )},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are AgriAgent, an intelligent agricultural assistant. "
+                        "When given farmer text, respond clearly and practically, focusing "
+                        "on crops, livestock, soil, weather, or pest management."
+                    ),
+                },
                 {"role": "user", "content": prompt_text},
             ],
             max_tokens=500,
@@ -31,15 +38,18 @@ def ai_reply_text(prompt_text: str) -> str:
     except Exception as e:
         return f"AI error: {e}"
 
-# ---------- Health ----------
+
+# ---------- Health check ----------
 @router.get("/check")
 def check():
-    return {"ok": True, "status": "ok", "service": "AgriAgent API", "version": "1.3.0"}
+    return {"ok": True, "status": "ok", "service": "AgriAgent API", "version": "2.0.0"}
 
-# ---------- Text ----------
+
+# ---------- Text chat ----------
 class ChatIn(BaseModel):
     text: str | None = None
     message: str | None = None
+
 
 @router.post("/chat")
 async def chat(payload: dict):
@@ -47,23 +57,25 @@ async def chat(payload: dict):
     reply = ai_reply_text(f"Farmer says: {text}")
     return {"reply": reply}
 
+
 @router.post("/message")
 async def message(payload: ChatIn):
     text = payload.text or payload.message or ""
     reply = ai_reply_text(f"Farmer says: {text}")
     return {"reply": reply}
 
-# ---------- Image ----------
+
+# ---------- Image Identification ----------
 @router.post("/identify")
 async def identify(
     file: UploadFile = File(None),
     image: UploadFile = File(None),
-    context: str | None = Form(default=None)  # ← optional crop/location/symptom hint from app
+    context: str | None = Form(default=None)
 ):
     """
-    Accepts the image in 'file' (preferred) or 'image'.
-    Optional 'context' form field lets the app pass a short note like:
-      'maize leaves in Kenya, yellowing edges after rain'.
+    Identifies plants, animals, insects, or crop issues from an uploaded image.
+    Accepts image in 'file' (preferred) or 'image'.
+    Optional 'context' (text hint) may include region, crop, or symptoms.
     """
     upload = file or image
     if not upload:
@@ -75,30 +87,57 @@ async def identify(
         if not guessed or not guessed.startswith("image/"):
             raise HTTPException(status_code=400, detail=f"Invalid image type: {ctype or 'unknown'}")
 
-    # Read bytes so large uploads are consumed (even if we don't do vision yet)
-    _ = await upload.read()
+    # Read image bytes and encode in Base64 for API
+    img_bytes = await upload.read()
+    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_uri = f"data:{ctype};base64,{img_b64}"
 
-    # Strong, structured prompt with clear headings
+    if not client:
+        return {"ok": False, "error": "AI disabled — please set OPENAI_API_KEY."}
+
+    # Define a strong, structured prompt
     prompt = (
-        f"A farmer uploaded an image named '{upload.filename}'. "
-        f"Extra context from farmer (may be empty): {context or '(none provided)'}\n\n"
-        "You cannot see the pixels, but infer the MOST LIKELY crop/plant and issue from filename & context. "
-        "Return the answer in this exact format (no extra commentary):\n\n"
-        "Crop/Plant: <one short name>\n"
-        "Likely Problem: <one short diagnosis>\n"
-        "Why: <1–2 concise reasons based on common symptoms>\n"
-        "Recommended Action: <2–3 short, practical steps; safe, region-neutral>\n"
-        "Preventive Tips: <1–2 short tips>\n"
+        "You are AgriAgent, an expert agricultural assistant. "
+        "Analyze the following image of a plant, insect, or animal and provide a clear, structured answer:\n\n"
+        "1️⃣ **Crop/Plant/Animal:** Name or type\n"
+        "2️⃣ **Likely Problem:** Disease, pest, or condition (if any)\n"
+        "3️⃣ **Why:** Short explanation based on visible signs\n"
+        "4️⃣ **Recommended Action:** Practical treatment or management advice\n"
+        "5️⃣ **Preventive Tips:** How to avoid recurrence\n\n"
+        "If healthy, say 'Healthy specimen detected.' Be specific but concise."
     )
 
-    reply = ai_reply_text(prompt)
-    print(f"🖼️ /identify -> name={upload.filename} type={ctype} context={context!r} reply={reply[:120]}...")
-    return {"filename": upload.filename, "reply": reply}
-# ---------- Twilio ----------
+    try:
+        # Send image and text context to OpenAI Vision model
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_text", "text": f"Farmer's context: {context or 'none provided'}"},
+                        {"type": "input_image", "image_data": data_uri},
+                    ],
+                }
+            ],
+        )
+
+        reply_text = response.output[0].content[0].text.strip()
+        print(f"🖼️ /identify -> name={upload.filename} type={ctype} context={context!r} reply={reply_text[:120]}...")
+        return {"ok": True, "filename": upload.filename, "reply": reply_text}
+
+    except Exception as e:
+        print(f"❌ Image identify error: {e}")
+        return {"ok": False, "error": f"AI error: {e}"}
+
+
+# ---------- Twilio Webhook ----------
 def twiml_reply(text: str) -> Response:
     safe = html.escape(text, quote=True)
     xml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>'
     return Response(content=xml, media_type="application/xml")
+
 
 @router.post("/webhook")
 async def whatsapp_webhook(
@@ -118,6 +157,7 @@ async def whatsapp_webhook(
         prompt = f"Farmer says: {Body or '(no text)'}"
     reply = ai_reply_text(prompt)
     return twiml_reply(reply)
+
 
 @router.post("/webhook/")
 async def whatsapp_webhook_trailing(
